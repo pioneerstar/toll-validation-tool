@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Toll Recovery Tracker</title>
+    <!-- Tailwind (CDN JIT) to preserve your existing styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+  </head>
+  <body class="min-h-screen bg-gray-50">
+    <div id="root"></div>
+
+    <script type="module">
+      // ESM CDN imports (no build step needed)
+      import React, { useEffect, useState } from "https://esm.sh/react@18";
+      import { createRoot } from "https://esm.sh/react-dom@18/client";
+      import * as XLSX from "https://esm.sh/xlsx@0.18.5";
+      import jsPDF from "https://esm.sh/jspdf@2.5.1";
+      import autoTable from "https://esm.sh/jspdf-autotable@3.8.2";
+      import confetti from "https://esm.sh/canvas-confetti@1.9.3";
+
+      function parseExcel(file) {
+        return new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = (e) => {
+            try {
+              const data = new Uint8Array(e.target.result);
+              const wb = XLSX.read(data, { type: "array" });
+              const ws = wb.Sheets[wb.SheetNames[0]];
+              resolve(XLSX.utils.sheet_to_json(ws, { defval: null }));
+            } catch (err) {
+              reject(err);
+            }
+          };
+          reader.onerror = reject;
+          reader.readAsArrayBuffer(file);
+        });
+      }
+
+      function toDate(v) {
+        if (!v) return null;
+        if (v instanceof Date) return v;
+        if (typeof v === "number") {
+          const d = XLSX.SSF.parse_date_code(v);
+          if (!d) return null;
+          return new Date(Date.UTC(d.y, d.m - 1, d.d, d.H || 0, d.M || 0, d.S || 0));
+        }
+        const s = String(v).replace(/\u00A0/g, " ");
+        const d2 = new Date(s);
+        return isNaN(d2.getTime()) ? null : d2;
+      }
+
+      function parseMoney(v) {
+        if (v === null || v === undefined) return 0;
+        const s = String(v).trim();
+        const neg = /^\(.*\)$/.test(s);
+        const n = parseFloat(s.replace(/[,$()\s]/g, "").replace(/[^0-9.-]/g, ""));
+        if (isNaN(n)) return 0;
+        return neg ? -Math.abs(n) : n;
+      }
+
+      function extractPlateFromVehicle(v) {
+        const m = String(v || "").match(/\(\s*TX\s*#([A-Z0-9*]+)\s*\)/i);
+        return m ? m[1].replace(/\*/g, "").toUpperCase().trim() : null;
+      }
+
+      function normalizeTollPlate(p) {
+        if (!p) return null;
+        return String(p).replace(/TX\s*-\s*/i, "").toUpperCase().trim();
+      }
+
+      function fmt(n) {
+        return (n ?? 0).toLocaleString(undefined, { style: "currency", currency: "USD" });
+      }
+
+      function ageInDays(date, now = new Date()) {
+        const d = new Date(date);
+        return (now.getTime() - d.getTime()) / 86400000;
+      }
+
+      function download(blob, filename) {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
+
+      function App() {
+        const [turoFile, setTuroFile] = useState(null);
+        const [tollFile, setTollFile] = useState(null);
+        const [rows, setRows] = useState([]);
+        const [loading, setLoading] = useState(false);
+        const [error, setError] = useState("");
+        const [testSummary, setTestSummary] = useState("");
+        const [recovered, setRecovered] = useState(0);
+        const [checkedRows, setCheckedRows] = useState({});
+
+        async function processFiles() {
+          setError("");
+          if (!turoFile || !tollFile) {
+            setError("Select both files.");
+            return;
+          }
+          setLoading(true);
+          try {
+            const [turo, tolls] = await Promise.all([parseExcel(turoFile), parseExcel(tollFile)]);
+
+            const turoMapped = turo
+              .map((r) => {
+                const start = toDate(r["Trip start"]);
+                const end = toDate(r["Trip end"]);
+                const plate = (r.Plate || extractPlateFromVehicle(r.Vehicle))?.toUpperCase() || null;
+                const vehicle = r["Vehicle name"] || r.Vehicle || "";
+                return {
+                  reservationId: r["Reservation ID"],
+                  guest: r.Guest || "",
+                  vehicle,
+                  plate,
+                  start,
+                  end,
+                  reimbursed: parseMoney(r["Tolls & tickets"]),
+                };
+              })
+              .filter((r) => r.reservationId && r.start && r.end);
+
+            const byPlate = turoMapped.reduce((acc, r) => {
+              if (!r.plate) return acc;
+              if (!acc[r.plate]) acc[r.plate] = [];
+              acc[r.plate].push(r);
+              return acc;
+            }, {});
+
+            Object.values(byPlate).forEach((arr) => arr.sort((a, b) => a.start - b.start || a.end - b.end));
+
+            const tollParsed = tolls
+              .map((t) => {
+                const when =
+                  toDate(t["Transaction Entry Date/Time"]) ||
+                  toDate(t["Transaction Date"]) ||
+                  toDate(t["Date"]);
+                const amount = parseMoney(t["Transaction Amount"]) || parseMoney(t.Amount) || 0;
+                const plate = normalizeTollPlate(t["Plate"]) || normalizeTollPlate(t["License Plate"]) || null;
+                const location = t["Location"] || "";
+                return { when, amount, plate, location };
+              })
+              .filter((t) => t.when && t.plate);
+
+            const matches = [];
+            for (const toll of tollParsed) {
+              const cands = byPlate[toll.plate] || [];
+              let best = null;
+              for (const trip of cands) {
+                if (trip.start <= toll.when && toll.when <= trip.end) {
+                  if (!best) best = trip;
+                  else if (trip.start > best.start || (trip.start.getTime() === best.start.getTime() && trip.end < best.end))
+                    best = trip;
+                }
+              }
+              if (best) {
+                matches.push({ key: best.reservationId, amount: Math.abs(toll.amount) });
+              }
+            }
+
+            const agg = new Map();
+            for (const m of matches) {
+              agg.set(m.key, (agg.get(m.key) || 0) + (Number(m.amount) || 0));
+            }
+
+            const now = new Date();
+            const out = turoMapped
+              .map((t) => {
+                const total = +(agg.get(t.reservationId) || 0);
+                let diff = +(t.reimbursed || 0) - total;
+                if (Math.abs(diff) < 0.01) diff = 0;
+                return {
+                  reservationId: t.reservationId,
+                  guest: t.guest,
+                  vehicle: t.vehicle,
+                  plate: t.plate || "",
+                  tripStart: t.start,
+                  tripEnd: t.end,
+                  totalTolls: total,
+                  reimbursed: +(t.reimbursed || 0),
+                  difference: diff,
+                };
+              })
+              .filter((r) => r.difference < 0 && ageInDays(r.tripEnd, now) >= 7 && ageInDays(r.tripEnd, now) <= 90)
+              .sort((a, b) => a.vehicle.localeCompare(b.vehicle) || a.tripEnd - b.tripEnd);
+
+            setRows(out);
+            setCheckedRows({});
+            setRecovered(0);
+          } catch (e) {
+            console.error(e);
+            setError("Processing failed.");
+          } finally {
+            setLoading(false);
+          }
+        }
+
+        function burstConfetti() {
+          const bursts = 5;
+          const count = 300;
+          const spread = 120;
+          const scalar = 1;
+          for (let i = 0; i < bursts; i++) {
+            confetti({
+              particleCount: Math.floor(count / bursts),
+              spread,
+              startVelocity: 45,
+              ticks: 200,
+              scalar,
+              origin: { x: Math.random(), y: Math.random() * 0.7 + 0.1 },
+              disableForReducedMotion: true,
+            });
+          }
+        }
+
+        function toggleChecked(id, amount) {
+          setCheckedRows((prev) => {
+            const next = { ...prev };
+            if (next[id]) {
+              delete next[id];
+              setRecovered((r) => r - amount);
+            } else {
+              next[id] = true;
+              setRecovered((r) => r + amount);
+              burstConfetti();
+            }
+            return next;
+          });
+        }
+
+        function downloadCSV() {
+          const header = [
+            "Reservation ID",
+            "Guest",
+            "Vehicle",
+            "Plate",
+            "Trip Start",
+            "Trip End",
+            "Total Tolls",
+            "Tolls & tickets",
+            "Difference",
+            "Charged?",
+          ];
+          const lines = [
+            header.join(","),
+            ...rows.map((r) =>
+              [
+                r.reservationId,
+                JSON.stringify(r.guest || ""),
+                JSON.stringify(r.vehicle || ""),
+                r.plate || "",
+                new Date(r.tripStart).toISOString(),
+                new Date(r.tripEnd).toISOString(),
+                r.totalTolls.toFixed(2),
+                (r.reimbursed || 0).toFixed(2),
+                (r.difference || 0).toFixed(2),
+                checkedRows[r.reservationId] ? "yes" : "no",
+              ].join(",")
+            ),
+          ];
+          const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8" });
+          download(blob, "negative_delta_turo_tolls.csv");
+        }
+
+        function downloadPDF() {
+          const doc = new jsPDF({ orientation: "landscape" });
+          doc.setFontSize(14);
+          doc.text("Trips with Negative Toll Delta", 14, 14);
+          const body = rows.map((r) => [
+            r.reservationId,
+            r.guest,
+            r.vehicle,
+            r.plate,
+            new Date(r.tripStart).toLocaleString(),
+            new Date(r.tripEnd).toLocaleString(),
+            fmt(r.totalTolls),
+            fmt(r.reimbursed),
+            fmt(r.difference),
+            checkedRows[r.reservationId] ? "yes" : "no",
+          ]);
+          autoTable(doc, {
+            head: [[
+              "Reservation ID",
+              "Guest",
+              "Vehicle",
+              "Plate",
+              "Trip Start",
+              "Trip End",
+              "Total Tolls",
+              "Tolls & tickets",
+              "Difference",
+              "Charged?",
+            ]],
+            body,
+            startY: 20,
+            styles: { fontSize: 8 },
+            headStyles: { fillColor: false },
+            theme: "grid",
+            columnStyles: { 2: { cellWidth: 50 }, 4: { cellWidth: 35 }, 5: { cellWidth: 35 } },
+          });
+          doc.save("negative_delta_turo_tolls.pdf");
+        }
+
+        useEffect(() => {
+          let p = 0,
+            f = 0;
+          function check(name, cond) {
+            if (cond) p++;
+            else {
+              f++;
+              console.error("Test failed:", name);
+            }
+          }
+          check("parseMoney $", parseMoney("$1.23") === 1.23);
+          check("parseMoney paren", parseMoney("(1.23)") === -1.23);
+          check("parseMoney comma", parseMoney("1,234.56") === 1234.56);
+          check("parseMoney invalid", parseMoney("abc") === 0);
+          check("parseMoney paren+sym", parseMoney("($1,234.56)") === -1234.56);
+          check("parseMoney empty", parseMoney("") === 0);
+          check("parseMoney neg-$", parseMoney(" -$2.50 ") === -2.5);
+          const d1 = toDate(45123);
+          check("toDate serial", d1 instanceof Date && !isNaN(d1.getTime()));
+          check("toDate iso", toDate("2025-08-13 10:30") instanceof Date);
+          check("toDate us", toDate("08/13/2025") instanceof Date);
+          check("toDate invalid => null", toDate("not a date") === null);
+          check("plate extract", extractPlateFromVehicle("Hyundai (TX #ABC1234)") === "ABC1234");
+          check("plate lower", extractPlateFromVehicle("Car (tx #abc1234)") === "ABC1234");
+          check("plate normalize", normalizeTollPlate("TX - abc1234") === "ABC1234");
+          check("plate normalize caps", normalizeTollPlate("TX - ABC1234") === "ABC1234");
+          const nowT = new Date();
+          const sevenAgo = new Date(nowT.getTime() - 7 * 86400000);
+          const sixAgo = new Date(nowT.getTime() - 6 * 86400000);
+          const ninetyAgo = new Date(nowT.getTime() - 90 * 86400000);
+          const ninetyOneAgo = new Date(nowT.getTime() - 91 * 86400000);
+          check("ageInDays 7", Math.round(ageInDays(sevenAgo, nowT)) === 7);
+          check("ageInDays >=7 true", ageInDays(sevenAgo, nowT) >= 7);
+          check("ageInDays <7 false", (ageInDays(sixAgo, nowT) >= 7) === false);
+          check("ageInDays <=90 true", ageInDays(ninetyAgo, nowT) <= 90);
+          check("ageInDays >90 false", (ageInDays(ninetyOneAgo, nowT) <= 90) === false);
+          setTestSummary(`${p} passed, ${f} failed`);
+        }, []);
+
+        return (
+          React.createElement(
+            "div",
+            { className: "min-h-screen w-full bg-gray-50 p-6" },
+            React.createElement(
+              "div",
+              { className: "max-w-6xl mx-auto" },
+              React.createElement(
+                "div",
+                { className: "mb-6 text-center" },
+                React.createElement("h1", { className: "text-3xl font-extrabold text-gray-800" }, "Toll Recovery Tracker"),
+                React.createElement(
+                  "p",
+                  { className: "text-base text-gray-600" },
+                  "Spot underpaid trips, track charges, and celebrate recoveries"
+                ),
+                React.createElement(
+                  "div",
+                  { className: "mt-4 text-4xl font-extrabold text-green-600" },
+                  `Recovered: ${fmt(recovered)}`
+                )
+              ),
+
+              React.createElement(
+                "div",
+                { className: "grid md:grid-cols-2 gap-4 mb-4" },
+                React.createElement(
+                  "div",
+                  { className: "p-4 bg-white rounded-2xl shadow" },
+                  React.createElement(
+                    "label",
+                    { className: "block text-sm font-medium mb-2" },
+                    "Turo spreadsheet (.xlsx)"
+                  ),
+                  React.createElement("input", {
+                    type: "file",
+                    accept: ".xlsx,.xls",
+                    onChange: (e) => setTuroFile(e.target.files?.[0] || null),
+                    className: "w-full",
+                  }),
+                  React.createElement(
+                    "p",
+                    { className: "text-xs text-gray-500 mt-2" },
+                    "Columns: Reservation ID, Guest, Vehicle/Vehicle name, Trip start, Trip end, Tolls & tickets."
+                  )
+                ),
+                React.createElement(
+                  "div",
+                  { className: "p-4 bg-white rounded-2xl shadow" },
+                  React.createElement(
+                    "label",
+                    { className: "block text-sm font-medium mb-2" },
+                    "Toll transactions (.xlsx)"
+                  ),
+                  React.createElement("input", {
+                    type: "file",
+                    accept: ".xlsx,.xls",
+                    onChange: (e) => setTollFile(e.target.files?.[0] || null),
+                    className: "w-full",
+                  }),
+                  React.createElement(
+                    "p",
+                    { className: "text-xs text-gray-500 mt-2" },
+                    "Columns: Transaction Entry Date/Time, Location, Plate, Transaction Amount."
+                  )
+                )
+              ),
+
+              React.createElement(
+                "div",
+                { className: "flex items-center gap-3 mb-4" },
+                React.createElement(
+                  "button",
+                  {
+                    onClick: processFiles,
+                    disabled: loading,
+                    className: "px-4 py-2 rounded-2xl bg-black text-white shadow disabled:opacity-50",
+                  },
+                  loading ? "Processing…" : "Process files"
+                ),
+                rows.length > 0 &&
+                  React.createElement(
+                    React.Fragment,
+                    null,
+                    React.createElement(
+                      "button",
+                      { onClick: downloadCSV, className: "px-3 py-2 rounded-2xl bg-white border shadow" },
+                      "Download CSV"
+                    ),
+                    React.createElement(
+                      "button",
+                      { onClick: downloadPDF, className: "px-3 py-2 rounded-2xl bg-white border shadow" },
+                      "Download PDF"
+                    )
+                  ),
+                testSummary &&
+                  React.createElement(
+                    "div",
+                    { className: "ml-auto text-xs text-gray-400" },
+                    `Tests: ${testSummary}`
+                  )
+              ),
+
+              error && React.createElement(
+                "div",
+                { className: "p-3 rounded bg-red-50 text-red-700 mb-4" },
+                error
+              ),
+
+              React.createElement(
+                "div",
+                { className: "bg-white rounded-2xl shadow overflow-hidden" },
+                React.createElement(
+                  "div",
+                  { className: "px-4 py-3 border-b flex items-center justify-between" },
+                  React.createElement(
+                    "div",
+                    { className: "text-sm text-gray-700" },
+                    `Results ${rows.length ? `— ${rows.length} trip(s)` : ""}`
+                  )
+                ),
+                React.createElement(
+                  "div",
+                  { className: "overflow-auto" },
+                  React.createElement(
+                    "table",
+                    { className: "min-w-full text-sm" },
+                    React.createElement(
+                      "thead",
+                      { className: "bg-gray-100" },
+                      React.createElement(
+                        "tr",
+                        null,
+                        [
+                          "Reservation ID",
+                          "Guest",
+                          "Vehicle",
+                          "Plate",
+                          "Trip Start",
+                          "Trip End",
+                          "Total Tolls",
+                          "Tolls & tickets",
+                          "Difference",
+                          "Charged?",
+                        ].map((h) => React.createElement("th", { key: h, className: "px-3 py-2 text-left" }, h))
+                      )
+                    ),
+                    React.createElement(
+                      "tbody",
+                      null,
+                      rows.length
+                        ? rows.map((r, i) =>
+                            React.createElement(
+                              "tr",
+                              { key: i, className: "bg-red-50" },
+                              React.createElement("td", { className: "px-3 py-2 font-mono" }, r.reservationId),
+                              React.createElement("td", { className: "px-3 py-2" }, r.guest),
+                              React.createElement("td", { className: "px-3 py-2" }, r.vehicle),
+                              React.createElement("td", { className: "px-3 py-2 font-mono" }, r.plate),
+                              React.createElement("td", { className: "px-3 py-2" }, new Date(r.tripStart).toLocaleString()),
+                              React.createElement("td", { className: "px-3 py-2" }, new Date(r.tripEnd).toLocaleString()),
+                              React.createElement("td", { className: "px-3 py-2" }, fmt(r.totalTolls)),
+                              React.createElement("td", { className: "px-3 py-2" }, fmt(r.reimbursed)),
+                              React.createElement("td", { className: "px-3 py-2 font-semibold" }, fmt(r.difference)),
+                              React.createElement(
+                                "td",
+                                { className: "px-3 py-2" },
+                                React.createElement("input", {
+                                  type: "checkbox",
+                                  checked: !!checkedRows[r.reservationId],
+                                  onChange: () => toggleChecked(r.reservationId, Math.abs(r.difference)),
+                                })
+                              )
+                            )
+                          )
+                        : React.createElement(
+                            "tr",
+                            null,
+                            React.createElement(
+                              "td",
+                              { colSpan: 10, className: "px-3 py-10 text-center text-gray-500" },
+                              "No results yet."
+                            )
+                          )
+                    )
+                  )
+                )
+              ),
+
+              React.createElement(
+                "div",
+                { className: "mt-6 text-xs text-gray-500" },
+                "Difference = (Tolls & tickets) − (Aggregated tolls). Values with |difference| < $0.01 are treated as $0."
+              )
+            )
+          )
+        );
+      }
+
+      createRoot(document.getElementById("root")).render(React.createElement(App));
+    </script>
+  </body>
+</html>
